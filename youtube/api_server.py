@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 8989
+BASE_DIR = "/storage/roms/ports/youtube"
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
+SOCKET_PATH = "/tmp/mpvsocket"
+YT_DLP_PATH = os.path.join(BASE_DIR, "yt-dlp")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+stream_cache = {}
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def get_auth():
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"connected": False, "name": "", "cookies": "", "topics": []}
+
+def save_auth(data):
+    try:
+        with open(AUTH_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+def parse_cookie_input(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "\t" in raw or "\n" in raw:
+        cookies = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies.append(f"{parts[5]}={parts[6]}")
+        if cookies:
+            return "; ".join(cookies)
+    return raw
+
+def mpv_send(cmd):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.4)
+        s.connect(SOCKET_PATH)
+        payload = json.dumps({"command": cmd}) + "\n"
+        s.sendall(payload.encode())
+        s.close()
+    except Exception:
+        pass
+
+def mpv_get_property(prop):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.2)
+        s.connect(SOCKET_PATH)
+        payload = json.dumps({"command": ["get_property", prop]}) + "\n"
+        s.sendall(payload.encode())
+        res = s.recv(1024).decode()
+        s.close()
+        data = json.loads(res.strip().split("\n")[0])
+        return data.get("data")
+    except Exception:
+        return None
+
+def parse_innertube_text(t):
+    if not t:
+        return ""
+    if isinstance(t, str):
+        return t
+    if isinstance(t, dict):
+        if "simpleText" in t:
+            return t["simpleText"]
+        if "runs" in t and isinstance(t["runs"], list):
+            return "".join(r.get("text", "") for r in t["runs"])
+    return ""
+
+def extract_videos(data):
+    results = []
+    seen = set()
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k in ["videoRenderer", "compactVideoRenderer", "gridVideoRenderer"]:
+                if k in obj:
+                    vr = obj[k]
+                    vid = vr.get("videoId")
+                    if vid and vid not in seen:
+                        seen.add(vid)
+                        title = parse_innertube_text(vr.get("title"))
+                        dur = parse_innertube_text(vr.get("lengthText")) or "--:--"
+                        author = parse_innertube_text(vr.get("ownerText")) or parse_innertube_text(vr.get("shortBylineText")) or "YouTube"
+                        views = parse_innertube_text(vr.get("viewCountText")) or parse_innertube_text(vr.get("shortViewCountText")) or "YouTube"
+                        if title:
+                            results.append({
+                                "id": vid,
+                                "title": title,
+                                "duration": dur,
+                                "channel": author,
+                                "views": views,
+                                "thumb_url": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                            })
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                walk(it)
+
+    walk(data)
+    return results
+
+def fetch_feed(query="", browse=None):
+    auth = get_auth()
+    cookies = auth.get("cookies", "")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": "2.20240401.01.00"
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+
+    if browse in ("home", "recommendations"):
+        # If user has cookies, try FEwhat_to_watch
+        if cookies:
+            try:
+                url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+                payload = {
+                    "context": {
+                        "client": {
+                            "clientName": "WEB",
+                            "clientVersion": "2.20240401.01.00",
+                            "hl": "pt",
+                            "gl": "BR",
+                            "utcOffsetMinutes": -180
+                        }
+                    },
+                    "browseId": "FEwhat_to_watch"
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                items = extract_videos(data)
+                if items:
+                    return items[:25]
+            except Exception:
+                pass
+
+        # If user defined custom topics
+        topics = auth.get("topics", [])
+        if topics:
+            combined = []
+            for t in topics[:3]:
+                res = fetch_feed(query=t)
+                combined.extend(res[:5])
+            if combined:
+                return combined[:25]
+
+        # Default fallback
+        return fetch_feed(query="Retro Gaming")
+
+    elif browse in ("subs", "subscriptions"):
+        if not cookies:
+            return []
+        try:
+            url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+            payload = {
+                "context": {
+                    "client": {
+                        "clientName": "WEB",
+                        "clientVersion": "2.20240401.01.00",
+                        "hl": "pt",
+                        "gl": "BR",
+                        "utcOffsetMinutes": -180
+                    }
+                },
+                "browseId": "FEsubscriptions"
+            }
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+            items = extract_videos(data)
+            return items[:25]
+        except Exception:
+            return []
+
+    # Standard Search
+    q = (query or "Retro Gaming").strip()
+    url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20240401.01.00",
+                "hl": "pt",
+                "gl": "BR"
+            }
+        },
+        "query": q
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        items = extract_videos(data)
+        return items[:25]
+    except Exception:
+        return []
+
+def verify_and_get_user(cookie_str):
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": "2.20240401.01.00",
+        "Cookie": cookie_str
+    }
+    url = "https://www.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false"
+    payload = {"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240401.01.00"}}}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        
+        # Search for user channel name or handle
+        def find_name(obj):
+            if isinstance(obj, dict):
+                for k in ["accountName", "channelHandle", "title"]:
+                    if k in obj:
+                        txt = parse_innertube_text(obj[k])
+                        if txt and "@" in txt or len(txt) > 2:
+                            return txt
+                for v in obj.values():
+                    res = find_name(v)
+                    if res: return res
+            elif isinstance(obj, list):
+                for it in obj:
+                    res = find_name(it)
+                    if res: return res
+            return None
+
+        name = find_name(data) or "Conta do YouTube"
+        return True, name
+    except Exception:
+        return False, None
+
+def get_stream_url(video_id):
+    if video_id in stream_cache:
+        return stream_cache[video_id]
+
+    try:
+        url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+        payload = {
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "21.26.364",
+                    "androidSdkVersion": 30,
+                    "userAgent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+                    "osName": "Android",
+                    "osVersion": "11"
+                }
+            },
+            "videoId": video_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+        formats = data.get("streamingData", {}).get("formats", [])
+        for f in formats:
+            stream_url = f.get("url")
+            if stream_url:
+                stream_cache[video_id] = stream_url
+                return stream_url
+    except Exception:
+        pass
+
+    # Fallback yt-dlp
+    try:
+        cmd = [YT_DLP_PATH, "--no-warnings", "-f", "18/b", "-g", f"https://www.youtube.com/watch?v={video_id}"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+        for line in res.stdout.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("http"):
+                stream_cache[video_id] = line
+                return line
+    except Exception:
+        pass
+    return None
+
+CONNECT_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YouTube DS - Conectar Conta</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background: #0f0f0f; color: #f1f1f1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; }
+  .container { max-width: 580px; margin: 0 auto; }
+  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .logo { background: #ff0000; color: white; font-weight: 900; padding: 8px 14px; border-radius: 8px; font-size: 18px; letter-spacing: -0.5px; }
+  .title { font-size: 22px; font-weight: 700; }
+  .badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }
+  .badge-off { background: #333; color: #aaa; }
+  .badge-on { background: #0e7039; color: #a4f4c2; border: 1px solid #1ba558; }
+  .card { background: #212121; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #333; }
+  .card h3 { margin-top: 0; color: #fff; font-size: 16px; }
+  .card p { color: #aaa; font-size: 14px; line-height: 1.5; margin-bottom: 14px; }
+  textarea, input[type="text"] { width: 100%; background: #121212; border: 1px solid #444; border-radius: 8px; color: #fff; padding: 12px; font-size: 14px; margin-bottom: 12px; font-family: inherit; }
+  textarea { min-height: 110px; font-family: monospace; font-size: 12px; }
+  button { background: #cc0000; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; width: 100%; transition: background 0.2s; }
+  button:hover { background: #ff0000; }
+  button.sec { background: #333; margin-top: 10px; }
+  button.sec:hover { background: #444; }
+  .alert { padding: 14px; border-radius: 8px; margin-bottom: 16px; display: none; font-size: 14px; line-height: 1.4; }
+  .alert-success { background: #135200; color: #b7eb8f; border: 1px solid #237804; }
+  .alert-error { background: #5c0011; color: #ffa39e; border: 1px solid #820014; }
+  .step { background: #181818; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ccc; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo">▶ YouTube DS</div>
+    <div class="title">Conectar Conta</div>
+  </div>
+
+  <div id="statusBadge" class="badge badge-off">Carregando status...</div>
+  <div id="alertBox" class="alert"></div>
+
+  <div class="card">
+    <h3>🍪 Opção 1: Conectar com Cookies do YouTube (Recomendado)</h3>
+    <p>Sincroniza suas <b>Recomendações Reais</b> e <b>Canais Inscritos</b> diretamente no seu Anbernic RG DS.</p>
+    
+    <div class="step">1. No navegador do PC/Celular, acesse <b>youtube.com</b> com sua conta logada.</div>
+    <div class="step">2. Use a extensão <b>"Get cookies.txt LOCALLY"</b> ou copie o cabeçalho <code>Cookie</code> no F12 (Rede).</div>
+    <div class="step">3. Cole abaixo e clique em <b>Conectar</b>:</div>
+    
+    <textarea id="cookiesInput" placeholder="Cole aqui seus cookies (formato texto ou cabeçalho)..."></textarea>
+    <button onclick="saveCookies()">Conectar com Cookies</button>
+  </div>
+
+  <div class="card">
+    <h3>⚡ Opção 2: Feed por Interesses & Canais</h3>
+    <p>Não quer copiar cookies? Digite seus tópicos e canais favoritos separados por vírgula para criar seu feed personalizado instantâneo:</p>
+    <input type="text" id="topicsInput" placeholder="Ex: Jogos Retrô, Nintendo DS, Speedruns, Gameplay, Trailer">
+    <button onclick="saveTopics()" style="background: #2563eb;">Salvar Interesses</button>
+  </div>
+
+  <div id="logoutSection" style="display:none;" class="card">
+    <button class="sec" onclick="logout()">Desconectar Conta do Console</button>
+  </div>
+</div>
+
+<script>
+async function loadStatus() {
+  try {
+    const res = await fetch('/auth/status');
+    const data = await res.json();
+    const badge = document.getElementById('statusBadge');
+    const logoutSec = document.getElementById('logoutSection');
+    if (data.connected) {
+      badge.className = 'badge badge-on';
+      badge.innerText = '✅ Conectado como: ' + (data.name || 'Conta YouTube');
+      logoutSec.style.display = 'block';
+    } else {
+      badge.className = 'badge badge-off';
+      badge.innerText = '⚪ Não Conectado';
+      logoutSec.style.display = 'none';
+    }
+  } catch(e) {}
+}
+
+function showAlert(msg, isSuccess) {
+  const box = document.getElementById('alertBox');
+  box.className = 'alert ' + (isSuccess ? 'alert-success' : 'alert-error');
+  box.innerText = msg;
+  box.style.display = 'block';
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+async function saveCookies() {
+  const raw = document.getElementById('cookiesInput').value;
+  if (!raw.trim()) { showAlert('Cole os cookies antes de salvar.', false); return; }
+  showAlert('Validando cookies com o YouTube...', true);
+  try {
+    const res = await fetch('/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cookies: raw})
+    });
+    const d = await res.json();
+    if (d.success) {
+      showAlert('✅ Conta conectada com sucesso! Olhe a tela do seu console.', true);
+      loadStatus();
+    } else {
+      showAlert('⚠️ ' + (d.message || 'Erro ao validar cookies.'), false);
+    }
+  } catch(e) {
+    showAlert('Erro de conexão com o servidor local.', false);
+  }
+}
+
+async function saveTopics() {
+  const val = document.getElementById('topicsInput').value;
+  if (!val.trim()) { showAlert('Digite ao menos um tópico.', false); return; }
+  try {
+    const res = await fetch('/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({topics: val})
+    });
+    const d = await res.json();
+    if (d.success) {
+      showAlert('✅ Interesses salvos! Feed personalizado atualizado no console.', true);
+      loadStatus();
+    }
+  } catch(e) {
+    showAlert('Erro de conexão.', false);
+  }
+}
+
+async function logout() {
+  if (!confirm('Deseja realmente desconectar?')) return;
+  await fetch('/auth/logout', {method: 'POST'});
+  showAlert('Conta desconectada com sucesso.', true);
+  loadStatus();
+}
+
+loadStatus();
+</script>
+</body>
+</html>
+"""
+
+class APIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/feed":
+            browse = params.get("browse", [None])[0]
+            q = params.get("q", [""])[0]
+            items = fetch_feed(query=q, browse=browse)
+            self.send_json(items)
+
+        elif parsed.path == "/auth/status":
+            auth = get_auth()
+            ip = get_local_ip()
+            self.send_json({
+                "connected": auth.get("connected", False),
+                "name": auth.get("name", ""),
+                "ip": ip,
+                "port": PORT,
+                "connect_url": f"http://{ip}:{PORT}/connect"
+            })
+
+        elif parsed.path == "/connect":
+            body = CONNECT_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/auth/logout":
+            save_auth({"connected": False, "name": "", "cookies": "", "topics": []})
+            self.send_json({"success": True})
+
+        elif parsed.path == "/stream":
+            vid = params.get("id", [""])[0]
+            url = get_stream_url(vid) if vid else None
+            self.send_json({"url": url})
+
+        elif parsed.path == "/mpv":
+            action = params.get("action", [""])[0]
+            if action == "play":
+                vid = params.get("id", [""])[0]
+                url = get_stream_url(vid) if vid else None
+                if url:
+                    mpv_send(["loadfile", url, "replace"])
+                    self.send_json({"status": "playing", "url": url})
+                else:
+                    self.send_json({"status": "error", "message": "no_stream"})
+            elif action == "preview":
+                vid = params.get("id", [""])[0]
+                if vid:
+                    mpv_send(["loadfile", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg", "replace"])
+                self.send_json({"status": "previewing"})
+            elif action == "pause":
+                mpv_send(["cycle", "pause"])
+                self.send_json({"status": "paused_cycled"})
+            elif action == "stop":
+                mpv_send(["stop"])
+                self.send_json({"status": "stopped"})
+            elif action == "seek":
+                val = int(params.get("val", [10])[0])
+                mpv_send(["seek", val, "relative"])
+                self.send_json({"status": "seeked"})
+            elif action == "vol":
+                val = int(params.get("val", [5])[0])
+                mpv_send(["add", "volume", val])
+                self.send_json({"status": "volume_adjusted"})
+            else:
+                self.send_json({"status": "unknown_action"})
+
+        elif parsed.path == "/status":
+            pos = mpv_get_property("time-pos") or 0
+            dur = mpv_get_property("duration") or 0
+            pause = mpv_get_property("pause")
+            vol = mpv_get_property("volume") or 100
+            self.send_json({
+                "time_pos": pos,
+                "duration": dur,
+                "pause": bool(pause),
+                "volume": vol
+            })
+
+        elif parsed.path == "/thumb":
+            vid = params.get("id", [""])[0]
+            cache_file = os.path.join(CACHE_DIR, f"{vid}.jpg")
+            if not os.path.exists(cache_file):
+                try:
+                    url = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        data = resp.read()
+                    with open(cache_file, "wb") as f:
+                        f.write(data)
+                except Exception:
+                    pass
+            if os.path.exists(cache_file):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(os.path.getsize(cache_file)))
+                self.end_headers()
+                with open(cache_file, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        content_len = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_len).decode("utf-8", errors="ignore") if content_len > 0 else ""
+
+        if parsed.path == "/connect":
+            try:
+                data = json.loads(raw_body)
+            except Exception:
+                data = dict(urllib.parse.parse_qsl(raw_body))
+
+            if "cookies" in data:
+                cookie_str = parse_cookie_input(data["cookies"])
+                ok, name = verify_and_get_user(cookie_str)
+                name = name or "Conta Conectada"
+                save_auth({
+                    "connected": True,
+                    "name": name,
+                    "cookies": cookie_str,
+                    "topics": []
+                })
+                self.send_json({"success": True, "name": name})
+            elif "topics" in data:
+                raw_topics = data["topics"]
+                if isinstance(raw_topics, str):
+                    topics = [t.strip() for t in raw_topics.split(",") if t.strip()]
+                else:
+                    topics = raw_topics
+                save_auth({
+                    "connected": True,
+                    "name": "Feed Personalizado",
+                    "cookies": "",
+                    "topics": topics
+                })
+                self.send_json({"success": True, "name": "Feed Personalizado"})
+            else:
+                self.send_json({"success": False, "message": "Dados inválidos"})
+
+        elif parsed.path == "/auth/logout":
+            save_auth({"connected": False, "name": "", "cookies": "", "topics": []})
+            self.send_json({"success": True})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def send_json(self, data):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+if __name__ == "__main__":
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), APIHandler)
+    print(f"API server running on port {PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass

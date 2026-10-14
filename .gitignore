@@ -1,0 +1,8 @@
+cache/*.jpg
+auth.json
+__pycache__/
+*.pyc
+*.pyo
+*.log
+/tmp/
+.DS_Store
