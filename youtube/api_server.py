@@ -14,12 +14,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = 8989
 BASE_DIR = "/storage/roms/ports/youtube"
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+DOWNLOADS_META = os.path.join(DOWNLOADS_DIR, "metadata.json")
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 SOCKET_PATH = "/tmp/mpvsocket"
 YT_DLP_PATH = os.path.join(BASE_DIR, "yt-dlp")
+QR_CACHE_FILE = os.path.join(CACHE_DIR, "qr_connect.png")
 
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
 stream_cache = {}
+download_status = {}  # vid -> {"status": "downloading"|"completed"|"error", "progress": int, "title": str}
+active_threads = {}
 
 def get_local_ip():
     try:
@@ -30,6 +37,22 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+def ensure_qr_code(ip=None):
+    if not ip:
+        ip = get_local_ip()
+    target_url = f"http://{ip}:{PORT}/connect"
+    if not os.path.exists(QR_CACHE_FILE) or os.path.getsize(QR_CACHE_FILE) < 100:
+        try:
+            api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&format=png&data={urllib.parse.quote(target_url)}"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = resp.read()
+            if len(data) > 100:
+                with open(QR_CACHE_FILE, "wb") as f:
+                    f.write(data)
+        except Exception:
+            pass
 
 def get_auth():
     if os.path.exists(AUTH_FILE):
@@ -149,7 +172,6 @@ def fetch_feed(query="", browse=None):
         headers["Cookie"] = cookies
 
     if browse in ("home", "recommendations"):
-        # If user has cookies, try FEwhat_to_watch
         if cookies:
             try:
                 url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
@@ -174,7 +196,6 @@ def fetch_feed(query="", browse=None):
             except Exception:
                 pass
 
-        # If user defined custom topics
         topics = auth.get("topics", [])
         if topics:
             combined = []
@@ -184,7 +205,6 @@ def fetch_feed(query="", browse=None):
             if combined:
                 return combined[:25]
 
-        # Default fallback
         return fetch_feed(query="Retro Gaming")
 
     elif browse in ("subs", "subscriptions"):
@@ -250,7 +270,6 @@ def verify_and_get_user(cookie_str):
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         
-        # Search for user channel name or handle
         def find_name(obj):
             if isinstance(obj, dict):
                 for k in ["accountName", "channelHandle", "title"]:
@@ -324,6 +343,123 @@ def get_stream_url(video_id):
     except Exception:
         pass
     return None
+
+# ========================================================
+# DOWNLOADS & OFFLINE STORAGE
+# ========================================================
+
+def get_downloads_list():
+    if not os.path.exists(DOWNLOADS_META):
+        return []
+    try:
+        with open(DOWNLOADS_META, "r") as f:
+            items = json.load(f)
+        valid = []
+        for it in items:
+            vid = it.get("id")
+            mp4_path = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4")
+            if os.path.exists(mp4_path):
+                it["file_path"] = mp4_path
+                it["size_mb"] = round(os.path.getsize(mp4_path) / (1024 * 1024), 1)
+                valid.append(it)
+        return valid
+    except Exception:
+        return []
+
+def save_downloads_list(items):
+    try:
+        with open(DOWNLOADS_META, "w") as f:
+            json.dump(items, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+def delete_download_item(vid):
+    mp4_path = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4")
+    jpg_path = os.path.join(DOWNLOADS_DIR, f"{vid}.jpg")
+    part_path = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4.part")
+    for p in [mp4_path, jpg_path, part_path]:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    items = get_downloads_list()
+    items = [it for it in items if it.get("id") != vid]
+    save_downloads_list(items)
+    if vid in download_status:
+        del download_status[vid]
+    return True
+
+def run_download_task(vid, title, channel, duration):
+    download_status[vid] = {"status": "downloading", "progress": 5, "title": title}
+    mp4_final = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4")
+    mp4_part = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4.part")
+    jpg_final = os.path.join(DOWNLOADS_DIR, f"{vid}.jpg")
+
+    try:
+        # 1. Download Thumbnail
+        thumb_url = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+        try:
+            req_t = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_t, timeout=4) as resp:
+                with open(jpg_final, "wb") as f_thumb:
+                    f_thumb.write(resp.read())
+        except Exception:
+            pass
+
+        # 2. Get stream URL
+        stream_url = get_stream_url(vid)
+        if not stream_url:
+            # Fallback yt-dlp direct download
+            cmd = [YT_DLP_PATH, "-f", "18/b", "-o", mp4_final, f"https://www.youtube.com/watch?v={vid}"]
+            subprocess.run(cmd, timeout=300)
+        else:
+            req = urllib.request.Request(stream_url, headers={"User-Agent": "com.google.android.youtube/21.26.364"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                total_len = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(mp4_part, "wb") as f_out:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        downloaded += len(chunk)
+                        if total_len > 0:
+                            pct = int((downloaded / total_len) * 95)
+                            download_status[vid]["progress"] = max(5, pct)
+            if os.path.exists(mp4_part):
+                os.replace(mp4_part, mp4_final)
+
+        if os.path.exists(mp4_final) and os.path.getsize(mp4_final) > 10000:
+            size_mb = round(os.path.getsize(mp4_final) / (1024 * 1024), 1)
+            items = get_downloads_list()
+            # Remove duplicate if exists
+            items = [it for it in items if it.get("id") != vid]
+            items.insert(0, {
+                "id": vid,
+                "title": title or "Vídeo",
+                "channel": channel or "YouTube",
+                "duration": duration or "--:--",
+                "size_mb": size_mb,
+                "date": time.strftime("%d/%m/%Y"),
+                "file_path": mp4_final,
+                "thumb_path": jpg_final
+            })
+            save_downloads_list(items)
+            download_status[vid] = {"status": "completed", "progress": 100, "title": title}
+        else:
+            download_status[vid] = {"status": "error", "progress": 0, "title": title}
+    except Exception as e:
+        download_status[vid] = {"status": "error", "progress": 0, "title": title, "error": str(e)}
+
+def start_download_thread(vid, title, channel, duration):
+    if vid in download_status and download_status[vid]["status"] == "downloading":
+        return
+    t = threading.Thread(target=run_download_task, args=(vid, title, channel, duration), daemon=True)
+    active_threads[vid] = t
+    t.start()
 
 CONNECT_HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -472,6 +608,9 @@ loadStatus();
 """
 
 class APIHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
@@ -485,6 +624,7 @@ class APIHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/auth/status":
             auth = get_auth()
             ip = get_local_ip()
+            ensure_qr_code(ip)
             self.send_json({
                 "connected": auth.get("connected", False),
                 "name": auth.get("name", ""),
@@ -492,6 +632,32 @@ class APIHandler(BaseHTTPRequestHandler):
                 "port": PORT,
                 "connect_url": f"http://{ip}:{PORT}/connect"
             })
+
+        elif parsed.path == "/qr":
+            ip = get_local_ip()
+            ensure_qr_code(ip)
+            if os.path.exists(QR_CACHE_FILE):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(os.path.getsize(QR_CACHE_FILE)))
+                self.end_headers()
+                with open(QR_CACHE_FILE, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        elif parsed.path == "/downloads":
+            items = get_downloads_list()
+            self.send_json({
+                "downloads": items,
+                "active": download_status
+            })
+
+        elif parsed.path == "/download/status":
+            vid = params.get("id", [""])[0]
+            st = download_status.get(vid, {"status": "none", "progress": 0})
+            self.send_json(st)
 
         elif parsed.path == "/connect":
             body = CONNECT_HTML.encode("utf-8")
@@ -520,10 +686,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_json({"status": "playing", "url": url})
                 else:
                     self.send_json({"status": "error", "message": "no_stream"})
+            elif action == "play_local":
+                vid = params.get("id", [""])[0]
+                mp4_file = os.path.join(DOWNLOADS_DIR, f"{vid}.mp4")
+                if os.path.exists(mp4_file):
+                    mpv_send(["loadfile", mp4_file, "replace"])
+                    self.send_json({"status": "playing_local", "file": mp4_file})
+                else:
+                    self.send_json({"status": "error", "message": "file_not_found"})
             elif action == "preview":
                 vid = params.get("id", [""])[0]
                 if vid:
-                    mpv_send(["loadfile", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg", "replace"])
+                    local_jpg = os.path.join(DOWNLOADS_DIR, f"{vid}.jpg")
+                    if os.path.exists(local_jpg):
+                        mpv_send(["loadfile", local_jpg, "replace"])
+                    else:
+                        mpv_send(["loadfile", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg", "replace"])
                 self.send_json({"status": "previewing"})
             elif action == "pause":
                 mpv_send(["cycle", "pause"])
@@ -556,8 +734,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/thumb":
             vid = params.get("id", [""])[0]
+            # Check offline downloaded thumbnail first
+            local_thumb = os.path.join(DOWNLOADS_DIR, f"{vid}.jpg")
             cache_file = os.path.join(CACHE_DIR, f"{vid}.jpg")
-            if not os.path.exists(cache_file):
+            target_file = local_thumb if os.path.exists(local_thumb) else cache_file
+
+            if not os.path.exists(target_file):
                 try:
                     url = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -565,14 +747,16 @@ class APIHandler(BaseHTTPRequestHandler):
                         data = resp.read()
                     with open(cache_file, "wb") as f:
                         f.write(data)
+                    target_file = cache_file
                 except Exception:
                     pass
-            if os.path.exists(cache_file):
+
+            if os.path.exists(target_file):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(os.path.getsize(cache_file)))
+                self.send_header("Content-Length", str(os.path.getsize(target_file)))
                 self.end_headers()
-                with open(cache_file, "rb") as f:
+                with open(target_file, "rb") as f:
                     self.wfile.write(f.read())
             else:
                 self.send_response(404)
@@ -581,15 +765,39 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def do_HEAD(self):
-        self.do_GET()
-
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         content_len = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(content_len).decode("utf-8", errors="ignore") if content_len > 0 else ""
 
-        if parsed.path == "/connect":
+        if parsed.path == "/download":
+            try:
+                data = json.loads(raw_body)
+            except Exception:
+                data = dict(urllib.parse.parse_qsl(raw_body))
+            vid = data.get("id", "")
+            title = data.get("title", "Vídeo")
+            channel = data.get("channel", "YouTube")
+            duration = data.get("duration", "--:--")
+            if vid:
+                start_download_thread(vid, title, channel, duration)
+                self.send_json({"success": True, "status": "started", "id": vid})
+            else:
+                self.send_json({"success": False, "message": "missing_id"})
+
+        elif parsed.path == "/download/delete":
+            try:
+                data = json.loads(raw_body)
+            except Exception:
+                data = dict(urllib.parse.parse_qsl(raw_body))
+            vid = data.get("id", "")
+            if vid:
+                delete_download_item(vid)
+                self.send_json({"success": True, "status": "deleted", "id": vid})
+            else:
+                self.send_json({"success": False, "message": "missing_id"})
+
+        elif parsed.path == "/connect":
             try:
                 data = json.loads(raw_body)
             except Exception:
