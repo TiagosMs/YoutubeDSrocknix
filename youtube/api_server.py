@@ -12,7 +12,7 @@ import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8989
-BASE_DIR = "/storage/roms/ports/youtube"
+BASE_DIR = "/storage/roms/ports/youtube" if os.path.exists("/storage") else os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 DOWNLOADS_META = os.path.join(DOWNLOADS_DIR, "metadata.json")
@@ -21,8 +21,11 @@ SOCKET_PATH = "/tmp/mpvsocket"
 YT_DLP_PATH = os.path.join(BASE_DIR, "yt-dlp")
 QR_CACHE_FILE = os.path.join(CACHE_DIR, "qr_connect.png")
 
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+try:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+except Exception:
+    pass
 
 stream_cache = {}
 download_status = {}  # vid -> {"status": "downloading"|"completed"|"error", "progress": int, "title": str}
@@ -61,7 +64,7 @@ def get_auth():
                 return json.load(f)
         except Exception:
             pass
-    return {"connected": False, "name": "", "cookies": "", "topics": []}
+    return {"connected": False, "name": "", "cookies": "", "topics": [], "channels": []}
 
 def save_auth(data):
     try:
@@ -87,6 +90,20 @@ def parse_cookie_input(raw):
         if cookies:
             return "; ".join(cookies)
     return raw
+
+def parse_csv_subscriptions(raw_text):
+    channels = []
+    for line in (raw_text or "").strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("Channel Id"):
+            continue
+        parts = line.split(",")
+        if len(parts) >= 3:
+            cid = parts[0].strip()
+            title = parts[2].strip().strip('"')
+            if cid and title:
+                channels.append({"id": cid, "title": title})
+    return channels
 
 def mpv_send(cmd):
     try:
@@ -205,32 +222,59 @@ def fetch_feed(query="", browse=None):
             if combined:
                 return combined[:25]
 
+        channels = auth.get("channels", [])
+        if channels:
+            import random
+            sample = channels[:5] if len(channels) <= 5 else random.sample(channels, 5)
+            combined = []
+            for ch in sample:
+                res = fetch_feed(query=ch.get("title", ""))
+                if res:
+                    combined.extend(res[:3])
+            if combined:
+                return combined[:25]
+
         return fetch_feed(query="Retro Gaming")
 
     elif browse in ("subs", "subscriptions"):
-        if not cookies:
-            return []
-        try:
-            url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
-            payload = {
-                "context": {
-                    "client": {
-                        "clientName": "WEB",
-                        "clientVersion": "2.20240401.01.00",
-                        "hl": "pt",
-                        "gl": "BR",
-                        "utcOffsetMinutes": -180
-                    }
-                },
-                "browseId": "FEsubscriptions"
-            }
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-            items = extract_videos(data)
-            return items[:25]
-        except Exception:
-            return []
+        if cookies:
+            try:
+                url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+                payload = {
+                    "context": {
+                        "client": {
+                            "clientName": "WEB",
+                            "clientVersion": "2.20240401.01.00",
+                            "hl": "pt",
+                            "gl": "BR",
+                            "utcOffsetMinutes": -180
+                        }
+                    },
+                    "browseId": "FEsubscriptions"
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                items = extract_videos(data)
+                if items:
+                    return items[:25]
+            except Exception:
+                pass
+
+        channels = auth.get("channels", [])
+        if channels:
+            import random
+            sample = channels[:8] if len(channels) <= 8 else random.sample(channels, 8)
+            combined = []
+            for ch in sample:
+                c_title = ch.get("title", "")
+                if c_title:
+                    res = fetch_feed(query=c_title)
+                    if res:
+                        combined.append(res[0])
+            if combined:
+                return combined[:25]
+        return []
 
     # Standard Search
     q = (query or "Retro Gaming").strip()
@@ -466,59 +510,92 @@ CONNECT_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YouTube DS - Conectar Conta</title>
+<title>YouTube DS - Conectar Conta Google</title>
 <style>
   * { box-sizing: border-box; }
-  body { background: #0f0f0f; color: #f1f1f1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; }
-  .container { max-width: 580px; margin: 0 auto; }
-  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-  .logo { background: #ff0000; color: white; font-weight: 900; padding: 8px 14px; border-radius: 8px; font-size: 18px; letter-spacing: -0.5px; }
-  .title { font-size: 22px; font-weight: 700; }
-  .badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }
+  body { background: #0f0f0f; color: #f1f1f1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px 14px; }
+  .container { max-width: 600px; margin: 0 auto; }
+  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .logo { background: #ff0000; color: white; font-weight: 900; padding: 7px 12px; border-radius: 8px; font-size: 16px; letter-spacing: -0.5px; }
+  .title { font-size: 20px; font-weight: 700; }
+  .badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 16px; }
   .badge-off { background: #333; color: #aaa; }
   .badge-on { background: #0e7039; color: #a4f4c2; border: 1px solid #1ba558; }
-  .card { background: #212121; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #333; }
-  .card h3 { margin-top: 0; color: #fff; font-size: 16px; }
-  .card p { color: #aaa; font-size: 14px; line-height: 1.5; margin-bottom: 14px; }
-  textarea, input[type="text"] { width: 100%; background: #121212; border: 1px solid #444; border-radius: 8px; color: #fff; padding: 12px; font-size: 14px; margin-bottom: 12px; font-family: inherit; }
-  textarea { min-height: 110px; font-family: monospace; font-size: 12px; }
-  button { background: #cc0000; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; width: 100%; transition: background 0.2s; }
+  .card { background: #1f1f1f; border-radius: 12px; padding: 18px; margin-bottom: 16px; border: 1px solid #333; }
+  .card h3 { margin-top: 0; color: #fff; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .card p { color: #aaa; font-size: 13.5px; line-height: 1.5; margin-bottom: 12px; }
+  .step { background: #141414; padding: 10px 12px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ccc; border-left: 3px solid #ff0000; }
+  .drop-zone { border: 2px dashed #444; border-radius: 10px; padding: 18px; text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s; margin-bottom: 12px; }
+  .drop-zone:hover { border-color: #ff0000; background: #262626; }
+  .drop-zone span { display: block; font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+  .drop-zone small { color: #888; font-size: 12px; }
+  textarea, input[type="text"] { width: 100%; background: #121212; border: 1px solid #444; border-radius: 8px; color: #fff; padding: 12px; font-size: 13px; margin-bottom: 12px; font-family: inherit; }
+  textarea { min-height: 90px; font-family: monospace; font-size: 11px; }
+  button { background: #cc0000; color: white; border: none; padding: 12px 18px; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; width: 100%; transition: background 0.2s; }
   button:hover { background: #ff0000; }
-  button.sec { background: #333; margin-top: 10px; }
+  button.sec { background: #333; margin-top: 8px; }
   button.sec:hover { background: #444; }
-  .alert { padding: 14px; border-radius: 8px; margin-bottom: 16px; display: none; font-size: 14px; line-height: 1.4; }
+  .alert { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; display: none; font-size: 13.5px; line-height: 1.4; }
   .alert-success { background: #135200; color: #b7eb8f; border: 1px solid #237804; }
   .alert-error { background: #5c0011; color: #ffa39e; border: 1px solid #820014; }
-  .step { background: #181818; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ccc; }
+  a { color: #3ea6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <div class="logo">▶ YouTube DS</div>
-    <div class="title">Conectar Conta</div>
+    <div class="title">Conectar Conta Google</div>
   </div>
 
   <div id="statusBadge" class="badge badge-off">Carregando status...</div>
   <div id="alertBox" class="alert"></div>
 
+  <!-- Método 1: Upload cookies.txt -->
   <div class="card">
-    <h3>🍪 Opção 1: Conectar com Cookies do YouTube (Recomendado)</h3>
-    <p>Sincroniza suas <b>Recomendações Reais</b> e <b>Canais Inscritos</b> diretamente no seu Anbernic RG DS.</p>
+    <h3>🍪 Método 1: Arquivo cookies.txt (Recomendado)</h3>
+    <p>Conecta sua conta real trazendo suas <b>Recomendações Reais da Home</b> e <b>Canais Inscritos</b>.</p>
     
-    <div class="step">1. No navegador do PC/Celular, acesse <b>youtube.com</b> com sua conta logada.</div>
-    <div class="step">2. Use a extensão <b>"Get cookies.txt LOCALLY"</b> ou copie o cabeçalho <code>Cookie</code> no F12 (Rede).</div>
-    <div class="step">3. Cole abaixo e clique em <b>Conectar</b>:</div>
+    <div class="step">1. No navegador do seu computador (Chrome, Edge ou Firefox), acesse o YouTube logado na sua conta Google.</div>
+    <div class="step">2. Instale a extensão <b>Get cookies.txt LOCALLY</b> e clique nela para baixar o arquivo <code>cookies.txt</code>.</div>
+    <div class="step">3. Clique na área abaixo ou selecione o arquivo baixado:</div>
     
-    <textarea id="cookiesInput" placeholder="Cole aqui seus cookies (formato texto ou cabeçalho)..."></textarea>
-    <button onclick="saveCookies()">Conectar com Cookies</button>
+    <div class="drop-zone" onclick="document.getElementById('fileCookie').click()">
+      <span>📁 Selecionar arquivo cookies.txt</span>
+      <small>Clique para escolher o arquivo baixado no seu PC/celular</small>
+      <input type="file" id="fileCookie" accept=".txt" style="display:none;" onchange="handleCookieFile(event)">
+    </div>
+
+    <details style="margin-top: 10px; font-size: 12.5px; color: #888;">
+      <summary style="cursor: pointer; color: #aaa; margin-bottom: 8px;">Ou colar texto dos cookies manualmente</summary>
+      <textarea id="cookiesInput" placeholder="Cole aqui o conteúdo do arquivo de cookies ou cabeçalho..."></textarea>
+      <button onclick="saveCookies()">Conectar via Cookies</button>
+    </details>
   </div>
 
+  <!-- Método 2: Google Takeout (Sem cookies) -->
   <div class="card">
-    <h3>⚡ Opção 2: Feed por Interesses & Canais</h3>
-    <p>Não quer copiar cookies? Digite seus tópicos e canais favoritos separados por vírgula para criar seu feed personalizado instantâneo:</p>
-    <input type="text" id="topicsInput" placeholder="Ex: Jogos Retrô, Nintendo DS, Speedruns, Gameplay, Trailer">
-    <button onclick="saveTopics()" style="background: #2563eb;">Salvar Interesses</button>
+    <h3>📂 Método 2: Importar Inscrições do Google Takeout</h3>
+    <p>Não quer lidar com extensões ou cookies? O Google permite baixar sua lista oficial de inscrições com 1 clique:</p>
+    
+    <div class="step">1. Acesse o <a href="https://takeout.google.com/takeout/custom/youtube" target="_blank">Google Takeout (YouTube)</a> com sua conta.</div>
+    <div class="step">2. Deixe marcado apenas <b>Inscrições</b> e baixe o arquivo <code>subscriptions.csv</code>.</div>
+    <div class="step">3. Envie o arquivo abaixo para carregar todos os seus canais:</div>
+
+    <div class="drop-zone" onclick="document.getElementById('fileCsv').click()" style="border-color: #2563eb;">
+      <span style="color:#60a5fa;">📄 Selecionar subscriptions.csv</span>
+      <small>Importa todos os canais inscritos da sua conta Google</small>
+      <input type="file" id="fileCsv" accept=".csv" style="display:none;" onchange="handleCsvFile(event)">
+    </div>
+  </div>
+
+  <!-- Método 3: Tópicos Personalizados -->
+  <div class="card">
+    <h3>⚡ Método 3: Tópicos & Canais Favoritos</h3>
+    <p>Digite tópicos ou canais favoritos separados por vírgula para criar seu feed:</p>
+    <input type="text" id="topicsInput" placeholder="Ex: Jogos Retrô, Nintendo DS, Gameplay, Speedruns">
+    <button onclick="saveTopics()" style="background: #2563eb;">Salvar Tópicos</button>
   </div>
 
   <div id="logoutSection" style="display:none;" class="card">
@@ -535,11 +612,11 @@ async function loadStatus() {
     const logoutSec = document.getElementById('logoutSection');
     if (data.connected) {
       badge.className = 'badge badge-on';
-      badge.innerText = '✅ Conectado como: ' + (data.name || 'Conta YouTube');
+      badge.innerText = '✅ Conectado como: ' + (data.name || 'Conta Google');
       logoutSec.style.display = 'block';
     } else {
       badge.className = 'badge badge-off';
-      badge.innerText = '⚪ Não Conectado';
+      badge.innerText = '⚪ Nenhuma conta conectada';
       logoutSec.style.display = 'none';
     }
   } catch(e) {}
@@ -553,10 +630,47 @@ function showAlert(msg, isSuccess) {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
+function handleCookieFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(evt) {
+    document.getElementById('cookiesInput').value = evt.target.result;
+    saveCookies();
+  };
+  reader.readAsText(file);
+}
+
+function handleCsvFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async function(evt) {
+    showAlert('Importando inscrições do Google Takeout...', true);
+    try {
+      const res = await fetch('/connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({csv: evt.target.result})
+      });
+      const d = await res.json();
+      if (d.success) {
+        showAlert('✅ ' + d.name + ' importada com sucesso! Olhe seu console.', true);
+        loadStatus();
+      } else {
+        showAlert('⚠️ ' + (d.message || 'Erro ao importar CSV.'), false);
+      }
+    } catch(err) {
+      showAlert('Erro ao enviar CSV.', false);
+    }
+  };
+  reader.readAsText(file);
+}
+
 async function saveCookies() {
   const raw = document.getElementById('cookiesInput').value;
-  if (!raw.trim()) { showAlert('Cole os cookies antes de salvar.', false); return; }
-  showAlert('Validando cookies com o YouTube...', true);
+  if (!raw.trim()) { showAlert('Selecione o arquivo de cookies antes de salvar.', false); return; }
+  showAlert('Validando sessão com o YouTube...', true);
   try {
     const res = await fetch('/connect', {
       method: 'POST',
@@ -565,7 +679,7 @@ async function saveCookies() {
     });
     const d = await res.json();
     if (d.success) {
-      showAlert('✅ Conta conectada com sucesso! Olhe a tela do seu console.', true);
+      showAlert('✅ Conta conectada como: ' + d.name + '! Olhe a tela do console.', true);
       loadStatus();
     } else {
       showAlert('⚠️ ' + (d.message || 'Erro ao validar cookies.'), false);
@@ -586,7 +700,7 @@ async function saveTopics() {
     });
     const d = await res.json();
     if (d.success) {
-      showAlert('✅ Interesses salvos! Feed personalizado atualizado no console.', true);
+      showAlert('✅ Feed configurado com sucesso!', true);
       loadStatus();
     }
   } catch(e) {
@@ -597,7 +711,7 @@ async function saveTopics() {
 async function logout() {
   if (!confirm('Deseja realmente desconectar?')) return;
   await fetch('/auth/logout', {method: 'POST'});
-  showAlert('Conta desconectada com sucesso.', true);
+  showAlert('Conta desconectada do console.', true);
   loadStatus();
 }
 
@@ -806,14 +920,29 @@ class APIHandler(BaseHTTPRequestHandler):
             if "cookies" in data:
                 cookie_str = parse_cookie_input(data["cookies"])
                 ok, name = verify_and_get_user(cookie_str)
-                name = name or "Conta Conectada"
+                name = name or "Conta Google Conectada"
                 save_auth({
                     "connected": True,
                     "name": name,
                     "cookies": cookie_str,
-                    "topics": []
+                    "topics": [],
+                    "channels": []
                 })
                 self.send_json({"success": True, "name": name})
+            elif "csv" in data:
+                channels = parse_csv_subscriptions(data["csv"])
+                if channels:
+                    name = f"Google ({len(channels)} canais)"
+                    save_auth({
+                        "connected": True,
+                        "name": name,
+                        "cookies": "",
+                        "topics": [c["title"] for c in channels[:10]],
+                        "channels": channels
+                    })
+                    self.send_json({"success": True, "name": name, "count": len(channels)})
+                else:
+                    self.send_json({"success": False, "message": "Nenhum canal válido encontrado no arquivo subscriptions.csv"})
             elif "topics" in data:
                 raw_topics = data["topics"]
                 if isinstance(raw_topics, str):
@@ -824,7 +953,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     "connected": True,
                     "name": "Feed Personalizado",
                     "cookies": "",
-                    "topics": topics
+                    "topics": topics,
+                    "channels": []
                 })
                 self.send_json({"success": True, "name": "Feed Personalizado"})
             else:
